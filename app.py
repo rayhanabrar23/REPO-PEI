@@ -6,6 +6,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
+import data_loader as dl
+import market_data as md
+import calc_engine as ce
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -232,6 +236,19 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ============================================================
+# DATA LOADING (cached)
+# ============================================================
+@st.cache_data(ttl=3600)
+def get_data():
+    return dl.load_all()
+
+
+@st.cache_data(ttl=900)
+def get_market_metrics(kode_saham: str):
+    return md.fetch_stock_metrics(kode_saham)
+
+
+# ============================================================
 # HEADER
 # ============================================================
 col_title, col_logo = st.columns([5, 1])
@@ -305,7 +322,54 @@ with st.container():
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================
-# SIMULATOR (placeholder logic — engine perhitungan menyusul)
+# HELPER: render hasil simulasi (didefinisikan sebelum dipakai)
+# ============================================================
+def render_hasil_saham(r: dict):
+    st.markdown(
+        f"""
+        <div class="pei-result-box">
+            <div class="pei-result-label">Estimasi Nilai Pendanaan (Saham)</div>
+            <div class="pei-result-value">Rp {r['estimasi_pendanaan']:,.0f}</div>
+            <div style="color:var(--gray); font-size:0.8rem; margin-top:0.4rem;">
+                Nilai Jaminan: Rp {r['nilai_jaminan_final']:,.0f} &nbsp;•&nbsp;
+                Rasio: {r['recommended_ratio']}x &nbsp;•&nbsp;
+                Group: {r['group']} &nbsp;•&nbsp;
+                Haircut KPEI: {r['haircut_kpei_pct']}% ({r['kategori_haircut']})
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if r["kena_cap"]:
+        st.warning(
+            f"⚠️ Nilai jaminan dari {r['jumlah_lot']:,} lot melebihi batas maksimum per saham "
+            f"(Rp {r['max_coll_value_cap']:,.0f}). Perhitungan sudah memakai nilai setelah dipangkas."
+        )
+    with st.expander("Lihat detail perhitungan"):
+        st.json(r)
+
+
+def render_hasil_obligasi(r: dict):
+    st.markdown(
+        f"""
+        <div class="pei-result-box">
+            <div class="pei-result-label">Estimasi Nilai Pendanaan (Obligasi)</div>
+            <div class="pei-result-value">Rp {r['estimasi_pendanaan']:,.0f}</div>
+            <div style="color:var(--gray); font-size:0.8rem; margin-top:0.4rem;">
+                Nilai Jaminan: Rp {r['nilai_jaminan']:,.0f} &nbsp;•&nbsp;
+                Rasio: {r['rasio']*100:.0f}% &nbsp;•&nbsp;
+                Jenis: {r['jenis_obligasi']} ({r['kategori_risiko']})
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("Lihat detail perhitungan"):
+        st.json(r)
+
+
+# ============================================================
+# SIMULATOR — tersambung ke calc_engine asli (saham & obligasi)
 # ============================================================
 with st.container():
     st.markdown('<div class="pei-card">', unsafe_allow_html=True)
@@ -313,44 +377,116 @@ with st.container():
     st.markdown('<div class="pei-section-title">🧮 Simulator Perhitungan REPO</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="pei-section-desc">Simulasikan estimasi nilai pendanaan dari saham/obligasi yang akan Anda jaminkan. '
-        '<i>Catatan: formula perhitungan final (haircut, concentration limit, dsb.) masih dalam tahap pengembangan — '
-        'angka di bawah ini bersifat estimasi awal.</i></div>',
+        '<i>Catatan: ini estimasi awal, nilai final tetap melalui proses evaluasi & persetujuan.</i></div>',
         unsafe_allow_html=True,
     )
 
-    sim_col1, sim_col2, sim_col3 = st.columns(3)
-    with sim_col1:
+    try:
+        data = get_data()
+    except Exception as e:
+        st.error(f"Gagal memuat data referensi (cek folder `data/` di repo): {e}")
+        data = None
+
+    if data is not None:
         jenis_efek = st.selectbox("Jenis Efek", ["Saham", "Obligasi"])
-    with sim_col2:
-        kode_efek = st.text_input("Kode Efek", placeholder="Contoh: BBCA")
-    with sim_col3:
-        jumlah_lembar = st.number_input("Jumlah Lembar / Unit", min_value=0, step=100, value=0)
 
-    harga_efek = st.number_input("Estimasi Harga per Lembar (Rp)", min_value=0, step=50, value=0)
-
-    if st.button("Hitung Estimasi Pendanaan", key="sim_button"):
-        if jumlah_lembar > 0 and harga_efek > 0:
-            nilai_pasar = jumlah_lembar * harga_efek
-            # Placeholder haircut — akan digantikan engine perhitungan resmi
-            haircut_dummy = 0.50 if jenis_efek == "Saham" else 0.70
-            estimasi_pendanaan = nilai_pasar * haircut_dummy
-
-            st.markdown(
-                f"""
-                <div class="pei-result-box">
-                    <div class="pei-result-label">Estimasi Nilai Pendanaan (Sementara)</div>
-                    <div class="pei-result-value">Rp {estimasi_pendanaan:,.0f}</div>
-                    <div style="color:var(--gray); font-size:0.8rem; margin-top:0.4rem;">
-                        Nilai Pasar: Rp {nilai_pasar:,.0f} &nbsp;•&nbsp; Haircut Estimasi: {int((1-haircut_dummy)*100)}%
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+        # -------------------- SAHAM --------------------
+        if jenis_efek == "Saham":
+            daftar_saham_marjin = data["daftar_jaminan"]["saham_marjin"]
+            instrument_df = data["instrument"]
+            saham_tersedia = instrument_df[
+                (instrument_df["kode_efek"].isin(daftar_saham_marjin["kode_efek"]))
+                & (instrument_df["status"] == "Active")
+            ].copy()
+            saham_tersedia["display"] = (
+                saham_tersedia["kode_efek"] + " — " + saham_tersedia["nama_instrumen"].fillna("")
             )
+
+            sim_col1, sim_col2 = st.columns(2)
+            with sim_col1:
+                efek_pilihan = st.selectbox(
+                    "Kode Efek", options=sorted(saham_tersedia["display"].tolist())
+                )
+                kode_saham = efek_pilihan.split(" — ")[0]
+            with sim_col2:
+                jumlah_lot = st.number_input("Jumlah Lot", min_value=1, value=100, step=100)
+
+            if st.button("Hitung Estimasi Pendanaan", key="sim_button_saham"):
+                with st.spinner(f"Mengambil data harga {kode_saham}..."):
+                    market_metrics = get_market_metrics(kode_saham)
+
+                if "error" in market_metrics:
+                    st.error(market_metrics["error"])
+                else:
+                    instrument_row = instrument_df[instrument_df["kode_efek"] == kode_saham].iloc[0].to_dict()
+                    haircut_match = data["haircut_kpei"][data["haircut_kpei"]["kode_efek"] == kode_saham]
+                    lff_match = data["listed_freefloat"][data["listed_freefloat"]["kode_efek"] == kode_saham]
+
+                    if haircut_match.empty or lff_match.empty:
+                        st.error(f"Data pendukung untuk {kode_saham} (Haircut KPEI / Listed-Free Float) tidak lengkap.")
+                    else:
+                        result = ce.simulate_stock_funding(
+                            kode_saham, jumlah_lot, market_metrics, instrument_row,
+                            haircut_match.iloc[0].to_dict(), lff_match.iloc[0].to_dict(),
+                            data["rasio_saham_matrix"], data["rasio_saham_thresholds"],
+                        )
+                        if "error" in result:
+                            st.error(result["error"])
+                        else:
+                            render_hasil_saham(result)
+
+        # -------------------- OBLIGASI --------------------
         else:
-            st.warning("Mohon lengkapi jumlah lembar dan estimasi harga terlebih dahulu.")
+            statis_df = data["statis_efek"]
+            daftar_sbn = data["daftar_jaminan"]["sbn"]["kode_efek"]
+            daftar_korporasi = data["daftar_jaminan"]["obligasi_korporasi"]["kode_efek"]
+            kode_bisa_dijaminkan = set(daftar_sbn) | set(daftar_korporasi)
+
+            obligasi_tersedia = statis_df[
+                (statis_df["kode_efek"].isin(kode_bisa_dijaminkan))
+                & (statis_df["status"] == "ACTIVE")
+            ].copy()
+            obligasi_tersedia["display"] = (
+                obligasi_tersedia["kode_efek"] + " — " + obligasi_tersedia["nama_efek"].fillna("")
+            )
+
+            sim_col1, sim_col2 = st.columns(2)
+            with sim_col1:
+                efek_pilihan = st.selectbox(
+                    "Kode Efek", options=sorted(obligasi_tersedia["display"].tolist())
+                )
+                kode_obligasi = efek_pilihan.split(" — ")[0]
+            with sim_col2:
+                jumlah_unit = st.number_input("Jumlah Unit", min_value=1, value=100, step=10)
+
+            bond_row_match = statis_df[statis_df["kode_efek"] == kode_obligasi]
+            is_korporasi = (
+                not bond_row_match.empty
+                and bond_row_match.iloc[0]["tipe_instrumen"] == "CORPORATE BOND"
+            )
+            kategori_risiko_korporasi = "Sedang"
+            if is_korporasi:
+                kategori_risiko_korporasi = st.radio(
+                    "Kategori Risiko (rating obligasi belum tersedia di data — pilih manual)",
+                    options=["Sedang", "Tinggi"],
+                    horizontal=True,
+                )
+
+            if st.button("Hitung Estimasi Pendanaan", key="sim_button_obligasi"):
+                if bond_row_match.empty:
+                    st.error(f"Data obligasi {kode_obligasi} tidak ditemukan.")
+                else:
+                    result = ce.simulate_bond_funding(
+                        kode_obligasi, jumlah_unit, bond_row_match.iloc[0].to_dict(),
+                        kategori_risiko_korporasi=kategori_risiko_korporasi,
+                    )
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        render_hasil_obligasi(result)
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ============================================================
 # FORM PENGAJUAN CALON NASABAH
